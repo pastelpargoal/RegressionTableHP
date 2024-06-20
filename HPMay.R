@@ -37,11 +37,12 @@ library(mapproj)
 install.packages("stargazer")
 library(stargazer)
 
-HP= read.csv("HeatPumpDatasetMay.csv")
-CTHPAll = HP$`Heat_Pumps(2017)` + HP$`Heat_Pumps(2018)` + HP$`Heat_Pumps(2019)` + HP$`Heat_Pumps(2020)` + HP$`Heat_Pumps(2021)` + HP$`Heat_Pumps(2022)` + HP$`Heat_Pumps(2023)`
+CTj= read.csv("CTj.csv")
+CTHPAll = CTj$Heat_Pumps.2017. + CTj$Heat_Pumps.2018. + CTj$Heat_Pumps.2019. + CTj$Heat_Pumps.2020. + CTj$Heat_Pumps.2021. + CTj$Heat_Pumps.2022. + CTj$Heat_Pumps.2023.
 
 ###### SMALLEST AIC ######
 
+ll = as.numeric(CTj$Housing.Units)
 model1 = glm(CTHPAll ~  as.numeric(`Electricity`)+ offset(log(ll)) , family = "poisson", data = CTj)
 final_model = step(model1, direction = "forward")
 summary(final_model)
