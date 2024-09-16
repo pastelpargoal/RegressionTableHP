@@ -1,0 +1,119 @@
+rm(list=ls())
+graphics.off()
+
+setwd("C:\\Users\\pargo\\OneDrive\\Documents\\ResearchFall23")
+##########################################################
+
+library(dplyr)
+library(tigris)
+library(ggplot2)
+library(tidyverse)
+library(maps)
+library(sf)
+library(RColorBrewer)
+library(mapdata)
+library(ggmap)
+library(usmap)
+library(rio)
+library(viridis)
+library(mapproj)
+library(msm) # SP - for deltamethod()
+library(stargazer)
+library(MASS)
+
+library(proj4)
+library(spdep)
+library(viridis)
+library(gam)
+library(tidycensus)
+# Add your Census API key (replace with your actual key)
+#census_api_key("8c6ede097678ab573c38a653be82a1ea983b6687", install = TRUE)
+# 8c6ede097678ab573c38a653be82a1ea983b6687
+###########
+
+# Use this now - 9/12/24
+CTj = read.csv("CTj_Sep16U.csv")
+CTjj= read.csv("CTj.csv")
+CTjj = CTjj %>% dplyr::select("TOWN_NO", "TOWN")
+CTj = left_join(CTj, CTjj, by = "TOWN")
+
+CTHPAll = as.numeric(CTj$Heat_Pumps.2017.) + as.numeric(CTj$Heat_Pumps.2018.) + as.numeric(CTj$Heat_Pumps.2019.) + as.numeric(CTj$Heat_Pumps.2020.) + as.numeric(CTj$Heat_Pumps.2021.) + as.numeric(CTj$Heat_Pumps.2022.) + as.numeric(CTj$Heat_Pumps.2023.)
+
+####
+ll = as.numeric(CTj$Housing.Units)
+
+#############################
+
+# need to run this code everytime because the package isn't up to date
+install.packages("mgcv", repos = "https://cloud.r-project.org/")
+packageVersion("mgcv")
+library(Matrix)
+library(nlme)
+library(mgcv)
+library(sf)      # For spatial data manipulation
+library(spdep)   # For spatial dependence and weights
+library(mgcv)    # For Generalized Additive Models
+library(MASS)    # For negative binomial regression
+library(sp)
+library(spatialreg)
+library(spatial)
+
+# loading the data and cleaning it
+shapefile = st_read("C:/Users/pargo/OneDrive/Documents/ResearchFall23/CT_Vicinity_Town_Polygon.shp")
+
+CT_towns <- shapefile %>%
+  dplyr::filter(CT_LEGEND == "Connecticut")
+
+CT_townsU_area <- CT_towns %>%
+  # Group by TOWN_NO
+  dplyr::group_by(TOWN_NAME) %>%
+  # Summarize attributes while keeping geometry
+  dplyr::summarise(
+    geometry = st_union(geometry)  # Combine geometries using union
+ )
+
+
+colnames(CT_townsU_area)[1] = "TOWN"
+CTHP_A_All = as.numeric(CTj$CTAdopt17) + as.numeric(CTj$CTAdopt18) + as.numeric(CTj$CTAdopt19) + as.numeric(CTj$CTAdopt20) + as.numeric(CTj$CTAdopt21) + as.numeric(CTj$CTAdopt22) + as.numeric(CTj$CTAdopt23)
+
+CT <- dplyr::left_join(CT_townsU_area, CTj, by = "TOWN") %>% # SP: joining dataframe to shapefile to retain geometry
+  dplyr::mutate(CTHPAll = CTHPAll, ll = ll) %>%  dplyr::mutate(CTHP_A_All = CTHP_A_All, ll = ll)
+
+CT <- CT %>% mutate(row_id = row_number())
+
+colnames(CT)[52] = "TOWN_NO"
+colnames(CT)[48] = "T"
+
+
+# The actual code starts here - MRF smooth
+CT_clean <- st_make_valid(CT)  # Make sure the geometry is valid
+
+# Project the data to Albers Equal-Area (AEA)
+aea.proj <- "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=37.5 +lon_0=-96"
+shp_sf <- st_transform(CT_clean, crs = aea.proj)
+
+# If needed, convert the sf object to a data frame
+df <- as.data.frame(shp_sf)
+
+# Fit an initial regression model
+#model14 = glm.nb(CTHPAll ~ as.numeric(`Electricity`) + `White` + `Hispanic_or_Latino` + `Tenure_Owner_Occupied...` + as.numeric(`Fuel_oil_kerosene_etc.`) + `Unemployment.Rate`+ `Black_or_African_American`  + as.numeric(`Utility_gas`) + `SNAP_Recipients`+ `Poverty...`+ as.numeric(`Bottled_tank_or_LP_gas`) + `Median_Household_Income` + `Asian` + `Median.Home.Value` + offset(log(ll)) , data = CT)
+
+# Calculate residuals
+#df$residuals <- residuals(model14)
+
+# Define neighborhood structure for townships using sp
+shp_sp <- as(shp_sf, "Spatial")  # Convert back to Spatial object if needed
+nb <- poly2nb(shp_sp, row.names = df$TOWN_NO)
+# Assign names to the neighborhood structure
+names(nb) <- attr(nb, "region.id")
+# Create weights
+w_row <- nb2listw(nb, style = "W")
+
+# Fit the Generalized Additive Model (GAM) using residuals as the response variable
+ctrl <- gam.control(nthreads = 6)  # Use 6 parallel threads
+
+m2 <- gam(CTHP_A_All ~ s(as.factor(TOWN_NO), bs = 'mrf', xt = list(nb = nb)),  # Define MRF smooth
+          data = df,
+          method = 'REML',  # Fast version of REML smoothness selection
+          control = ctrl,
+          family = nb() ) 
