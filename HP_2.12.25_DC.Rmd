@@ -1,0 +1,460 @@
+---
+title: "HP_2.12.25_JH"
+author: "Joyce Hu"
+date: "2025-2-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+```{r}
+library(tidyverse)
+#library(dplyr)
+library(here)
+library(sf)
+library(sp)
+library(spatial)
+library(spdep)
+library(spatialreg)
+library(tidycensus)
+library(viridis)
+library(ggplot2)
+library(mgcv)      # GAMs and Negative Binomial
+library(MASS)      # Negative Binomial Regression
+#library(gam)
+# library(splines)
+library(DCluster)
+library(boot)
+library(Matrix)
+library(MRFtools)
+library(broom)
+#library(equatiomatic)
+library(patchwork)
+library(corrplot)
+library(foreach)
+library(devtools)
+library(renv)
+library(texreg)
+
+```
+
+Load and clean CT town demographics data
+```{r}
+# Check if 'data' directory exists; if not, create it
+if (!dir.exists(here("data"))) {
+  dir.create(here("data"))
+}
+
+# Add Census API key (if necessary)
+census_api_key("6d00926d677cbaeb0fcfc9cd3bc418b0c971e7e3", install = TRUE, overwrite = TRUE) #JH key
+
+# Obtaining relevant census variables using census codes
+variables <- c(
+  median_income = "B19013_001",
+  median_home_value = "B25077_001",
+  civilian_labor_force = "B23025_003",
+  median_year_built = "B25035_001", #JH-changed var name for clarity age calc in next step
+  owner_occupied = "DP04_0046P",
+  total_housing_units = "B25003_001",
+  total_population = "B02001_001",
+  poverty_population = "S1701_C03_001",
+  snap_recipients = "S2201_C04_001E",
+  unemployment_rate = "DP03_0020PE",
+  utility_gas = "B25040_002",
+  electricity = "B25040_003",
+  fuel_oil_kerosene = "B25040_004",
+  bottled_tank_LP_gas = "B25040_005",
+  white_population = "B02001_002",
+  black_population = "B02001_003",
+  asian_population = "B02001_005",
+  hispanic_population = "B03002_012"
+)
+
+
+# Get ACS data - the 2015 ACS 5 year average - 2011 to 2015 using pre-defined variables
+# Added in function to save cache version as tidycensus package/census.gov has been acting up - this will load a saved cache if downloading it causes an error - JH
+##
+get_ct_town_data <- function(force_refresh = FALSE) {
+  cache_file <- "ct_town_data_cache.rds"
+  
+  if (!force_refresh && file.exists(cache_file)) {
+    ct_town_data <- readRDS(cache_file)
+    message("Loaded data from cache file.")
+  } else {
+    tryCatch({
+      ct_town_data <- get_acs(
+        geography = "county subdivision", 
+        state = "CT", 
+        variables = variables, 
+        year = 2015, 
+        survey = "acs5"
+      )
+      
+      saveRDS(ct_town_data, file = cache_file)
+      message("Retrieved fresh data and saved to cache.")
+    }, error = function(e) {
+      if (file.exists(cache_file)) {
+        ct_town_data <- readRDS(cache_file)
+        warning("API call failed, loaded from cache instead. Error was: ", e$message)
+      } else {
+        stop("Failed to retrieve data and no cache file exists. Error: ", e$message)
+      }
+    })
+  }
+  
+  return(ct_town_data)
+}
+##
+ct_town_data <- get_ct_town_data()
+
+# Convert to wide format
+ct_town_data_wide <- ct_town_data %>%
+  dplyr::select(GEOID, NAME, variable, estimate) %>%
+  pivot_wider(names_from = variable, values_from = estimate)
+
+# Calculate values
+# Have to manually calculate them since the codes I pulled from, don't match with the actual census values (JH - I'm not sure I understand this comment? 2/12/25)
+ct_town_data_wide <- ct_town_data_wide %>%
+  dplyr::mutate(
+    utility_gas_percentage = (utility_gas / total_housing_units) * 100,
+    electricity_percentage = (electricity / total_housing_units) * 100,
+    fuel_oil_kerosene_percentage = (fuel_oil_kerosene / total_housing_units) * 100,
+    bottled_tank_LP_gas_percentage = (bottled_tank_LP_gas / total_housing_units) * 100,
+    white_percentage = (white_population / total_population) * 100,
+    black_percentage = (black_population / total_population) * 100,
+    asian_percentage = (asian_population / total_population) * 100,
+    hispanic_percentage = (hispanic_population / total_population) * 100,
+    median_home_age = 2015 - median_year_built) %>% # i.e. age of home in 2015 based on median year structure was built (JH) 
+  rename(
+    unemployment_rate = DP03_0020P,
+    snap_recipients = S2201_C04_001) #rename variables as they were not automatically renamed when pulling from codes (JH)
+
+# Create a vector of patterns to shorten name to only the town (JH - streamlined from prev)
+patterns_to_remove <- c(
+  # Planning Regions
+  " town, Naugatuck Valley Planning Region, Connecticut",
+  " town, Capitol Planning Region, Connecticut",
+  " town, Greater Bridgeport Planning Region, Connecticut",
+  " town, Lower Connecticut River Valley Planning Region, Connecticut",
+  " town, Northeastern Connecticut Planning Region, Connecticut",
+  " town, Northwest Hills Planning Region, Connecticut",
+  " town, South Central Connecticut Planning Region, Connecticut",
+  " town, Southeastern Connecticut Planning Region, Connecticut",
+  " town, Western Connecticut Planning Region, Connecticut",
+  
+  # Counties
+  paste(" town,", 
+        c("Fairfield", "Hartford", "Litchfield", "Middlesex", 
+          "New Haven", "New London", "Tolland", "Windham"),
+        "County, Connecticut")
+)
+
+row_remove = c("County subdivisions not defined, Fairfield County, Connecticut",
+               "County subdivisions not defined, Middlesex County, Connecticut",
+               "County subdivisions not defined, New Haven County, Connecticut",
+               "County subdivisions not defined, New London County, Connecticut")
+
+# Clean town names (ct_clean replacing CT_u in old code - JH)
+ct_clean <- ct_town_data_wide %>%
+  filter(!NAME %in% row_remove) %>%
+  mutate(NAME = stringr::str_remove_all(NAME, paste(patterns_to_remove, collapse="|")))  %>%
+  rename (town = NAME)
+
+```
+
+Load and clean heat pump data
+```{r}
+#heat_pump replacing HPU in old code
+heat_pump = read.csv("WS_Town_Cross.csv")
+
+# Clean data frame
+heat_pump = dplyr::select(heat_pump,"X","X2017.3" ,"X2018.3", "X2019.3", "X2020.3","X2021.4" ,"X2022.4","X2023.4")
+
+# Subset to only totals for each town, rename columns
+heat_pump <- heat_pump %>%
+  subset(!(row.names(heat_pump) %in% 1:2)) %>%  # Correct subset syntax
+  rename("heat_pump_2017" = "X2017.3",
+         "heat_pump_2018" = "X2018.3",
+         "heat_pump_2019" = "X2019.3",
+         "heat_pump_2020" = "X2020.3",
+         "heat_pump_2021" = "X2021.4",
+         "heat_pump_2022" = "X2022.4",
+         "heat_pump_2023" = "X2023.4",
+         "town" = "X")
+```
+
+Join heat pump and CT dataframes
+Calculate heat pump adoption
+```{r}
+### Joining the census data with heat pump data ###
+# Convert heat pump numbers to numeric
+# Replace heat pump NAs to 0 (as per HP_Maps_Full_Regression script)
+# Remove towns where all values are NA for heat pump columns - removes "Norwich", "Bozrah", "Wallingford" (from HP_DescriptiveStats file)
+ct_hp <- ct_clean %>% 
+  left_join(heat_pump, "town") %>%
+  mutate(across(c("heat_pump_2017", "heat_pump_2018", "heat_pump_2019", "heat_pump_2020", "heat_pump_2021", "heat_pump_2022", "heat_pump_2023"), as.numeric)) %>%
+  mutate(across(starts_with("heat_pump_"), ~ replace_na(., 0))) 
+ct_hp <- ct_hp[rowSums(!is.na(ct_hp[, grep("heat_pump_", names(ct_hp))])) > 0, ]
+
+#### Calculating heat pump adoption ###
+
+# in line 129 of original code, the black_population column is renamed as Housing.Units ?? this is then used as the denominator for heat pump adoption percentages.
+# assuming we should be using the existing total_housing_units column instead
+ct_hp <- ct_hp %>%
+  mutate(
+    hp_adoption_2017_percent = heat_pump_2017 / total_housing_units * 100,
+    hp_adoption_2018_percent = heat_pump_2018 / total_housing_units * 100,
+    hp_adoption_2019_percent = heat_pump_2019 / total_housing_units * 100,
+    hp_adoption_2020_percent = heat_pump_2020 / total_housing_units * 100,
+    hp_adoption_2021_percent = heat_pump_2021 / total_housing_units * 100,
+    hp_adoption_2022_percent = heat_pump_2022 / total_housing_units * 100,
+    hp_adoption_2023_percent = heat_pump_2023 / total_housing_units * 100
+  )
+
+# adding CTU info on total heat pump adoption percent into ct_hp here as well (lines 142-3 in HP_Maps_Full_Regression)
+ct_hp <- ct_hp %>% mutate(hp_adoption_total_percent =
+  hp_adoption_2017_percent + hp_adoption_2018_percent + hp_adoption_2019_percent +
+  hp_adoption_2020_percent + hp_adoption_2021_percent + hp_adoption_2022_percent +
+  hp_adoption_2023_percent)
+
+ct_hp <- ct_hp %>% mutate(heat_pump_all = heat_pump_2017 + heat_pump_2018 + heat_pump_2019 + heat_pump_2020 + heat_pump_2021 + heat_pump_2022 + heat_pump_2023) # total heat pump adoptions for all
+
+#ct_hp replaces ct_j, CTU in old code
+
+```
+
+
+```{r}
+# didn't do the CTj and CTjj join thing for town no. bc didn't appear to use no. after??
+```
+
+Read in CT shapefile
+Join geometry with ct_hp
+```{r}
+# Read in CT shapefile
+ct_shp <- st_read(here("data", "CT_Vicinity_Town_Polygon.shp"))
+
+# Subset to only CT towns (full shapefile include land in other states)
+ct_town_sf <- ct_shp %>%
+  dplyr::filter(CT_LEGEND == "Connecticut")
+
+
+#originally the code uses top_n(1, area) but this only selects the largest polygon per town and excludes the rest of the town's area. Instead, we want to get all the polygons of each town and join them. ct replaces CT in old code.
+
+ct <- ct_town_sf %>%
+  group_by(TOWN_NAME) %>%
+  summarize(geometry = st_union(geometry)) %>% # get full area of each town
+  rename("town" = TOWN_NAME) %>%
+  left_join(., ct_hp, by = "town") %>%
+  filter (!town %in% c("Norwich", "Bozrah", "Wallingford")) # removes the three towns we excluded from the other dataset - CHECK IF THIS DOESN'T IMPACT SPATIAL SMOOTHING??
+
+# RENAMED from "ll" in original script - JH
+housing_units = as.numeric(ct_hp$total_housing_units)
+
+```
+Moran's I Analysis
+```{r}
+offset_vec <- log(ct$total_housing_units) #instead of log(ll)
+
+# Fit the model - removed method = REML as does not work for neg bin - JH
+model <- gam(
+  heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage +
+    unemployment_rate + utility_gas_percentage + snap_recipients + median_home_age +
+    hispanic_percentage + poverty_population + median_home_value +
+    owner_occupied + median_income + bottled_tank_LP_gas_percentage +
+    black_percentage + white_percentage,
+    offset = offset_vec,
+  data = ct,
+  family = nb(),      
+)
+
+residuals_model = residuals(model)
+ct = ct %>% 
+  ungroup() %>%
+  mutate(residuals = residuals(model))
+ct$Observed <- ct$heat_pump_all  #  observed values
+ct$Expected <- fitted(model)  #  expected values from the model
+
+
+# Creating coordinates 
+centroids <- st_centroid(ct$geometry)
+coords <- st_coordinates(centroids) 
+coords <- as.data.frame(coords,  na.rm= TRUE )
+
+knn <- knearneigh(coords, k = 4)
+
+# Convert to neighbors list
+nb <- knn2nb(knn)
+
+# Create the weights list
+listw <- nb2listw(nb)
+
+moranI.stat(data=ct, applyto="residuals", listw=listw, n=length(nb2listw(nb)), 
+                S0=Szero(listw))
+# -6.788122e-05 - JH result vs 0.0004819395 PA result
+
+```
+
+Models using stepwise regression logic based on AIC based on PA results from a different script (not actual stepwise regression)
+```{r}
+models = list(
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas_percentage + snap_recipients, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas_percentage + snap_recipients + median_home_age, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas_percentage + snap_recipients + median_home_age + hispanic_percentage, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas_percentage + snap_recipients + median_home_age + hispanic_percentage + poverty_population, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas_percentage + snap_recipients + median_home_age + hispanic_percentage + poverty_population + median_home_value, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas_percentage + snap_recipients + median_home_age + hispanic_percentage + poverty_population + median_home_value + owner_occupied, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas_percentage + snap_recipients + median_home_age + hispanic_percentage + poverty_population + median_home_value + owner_occupied + median_income, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas_percentage + snap_recipients + median_home_age + hispanic_percentage + poverty_population + median_home_value + owner_occupied + median_income + bottled_tank_LP_gas_percentage, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas_percentage + snap_recipients + median_home_age + hispanic_percentage + poverty_population + median_home_value + owner_occupied + median_income + bottled_tank_LP_gas_percentage + black_percentage, offset = offset_vec, data = ct, family = nb()),
+  
+  gam(heat_pump_all ~ fuel_oil_kerosene_percentage + asian_percentage + electricity_percentage + unemployment_rate + utility_gas_percentage + snap_recipients + median_home_age + hispanic_percentage + poverty_population + median_home_value + owner_occupied + median_income + bottled_tank_LP_gas_percentage + black_percentage + white_percentage, offset = offset_vec, data = ct, family = nb())
+)
+```
+
+Scaling and transforming model results
+```{r}
+# Vector of scaling factors
+scale_factors <- c(
+  "hispanic_percentage" = 10,
+  "asian_percentage" = 10,
+  "black_percentage" = 10,
+  "white_percentage" = 10,
+  "owner_occupied" = 10,  
+  "median_home_age" = 10,
+  "median_income" = 10000
+)
+
+
+transform_model <- function(model, scale_factors) {
+  coefs <- coef(model)
+  vcov_matrix <- vcov(model)
+  std_errs <- sqrt(diag(vcov_matrix))
+  
+  # Scale
+  for (var in names(scale_factors)) {
+    if (var %in% names(coefs)) {
+      factor <- scale_factors[var]
+      coefs[var] <- coefs[var] * factor
+      std_errs[var] <- std_errs[var] * factor
+    }
+  }
+
+  # Exponentiate coefs and adjust std. errors with delta method
+  exp_coefs <- exp(coefs)
+  exp_std_errs <- std_errs * exp(coefs)  # Delta method
+
+  # Create a data frame for reporting
+  results <- data.frame(
+    term = names(exp_coefs),
+    estimate = exp_coefs,
+    std.error = exp_std_errs,
+    z = exp_coefs / exp_std_errs,
+    p.value = 2 * (1 - pnorm(abs(exp_coefs / exp_std_errs)))
+  )
+  return(results)
+}
+
+transformed_results <- lapply(models, transform_model, scale_factors = scale_factors)
+
+
+# Create texreg objects manually - JH - had trouble with stargazer so using texreg for preliminary results display
+texreg_list <- lapply(seq_along(models), function(i) {
+  model <- models[[i]]
+  res <- transform_model(model, scale_factors)
+
+  # Only keep transformed terms in the model
+  coefs <- res$estimate
+  se <- res$std.error
+  p <- res$p.value
+  names(coefs) <- res$term
+  names(se) <- res$term
+  names(p) <- res$term
+
+  createTexreg(
+    coef.names = names(coefs),
+    coef = unname(coefs),
+    se = unname(se),
+    pvalues = unname(p),
+    model.name = paste("Model", i)
+  )
+})
+
+# Display table
+screenreg(texreg_list, custom.model.names = paste0("Model ", seq_along(texreg_list)))
+
+```
+#################################################################################################
+################################################################################################
+
+Plotting descriptive maps
+```{r}
+# Map of total heat pumps (all years) per town
+ggplot() +
+  geom_sf(data = ct, aes(fill = heat_pump_all)) +
+  scale_fill_gradient(low = "lightblue", high = "orange", name = "Total Heat Pumps") +
+  theme_void() +
+  labs(title = "Total Heat Pump Adoption in Connecticut Towns (2017-2023)")
+
+# Map of heat pump adoption percentages 
+ggplot() +
+  geom_sf(data = ct, aes(fill = hp_adoption_total_percent)) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue",  name = "Heat Pump Adoptions (%)") +
+  theme_void() +
+  labs(title = "Total Heat Pump Adoption in Connecticut Towns (2017-2023)")
+
+```
+
+Correlation plot of variables
+```{r}
+# Create a correlation matrix
+ct_no_geo <- ct %>%
+  st_drop_geometry() %>%
+  dplyr::select(median_income, median_home_value, median_home_age, civilian_labor_force, 
+                owner_occupied, total_housing_units,
+                total_population, poverty_population, snap_recipients,
+                unemployment_rate, utility_gas, electricity, 
+                fuel_oil_kerosene, bottled_tank_LP_gas,
+                white_population, black_population, asian_population,
+                hispanic_population)
+
+# Load the corrplot package
+
+# Create the correlation matrix
+cor_matrix <- cor(ct_no_geo, use = "pairwise.complete.obs")
+
+
+# Create the correlation plot
+corrplot(cor_matrix, 
+         method = "circle",        # Use circles to represent correlations
+         type = "upper",           # Show only upper triangle 
+         order = "hclust",         # Order variables by hierarchical clustering
+         tl.col = "black",         # Text label color
+         tl.srt = 45,              # Rotate text labels
+         addCoef.col = "black",    # Add coefficient values in black
+         number.cex = 0.7,         # Size of coefficient text
+         diag = FALSE)             # Don't show diagonal
+
+
+```
